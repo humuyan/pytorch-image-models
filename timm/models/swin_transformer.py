@@ -29,6 +29,7 @@ from .helpers import build_model_with_cfg, named_apply, checkpoint_seq
 from .layers import PatchEmbed, Mlp, DropPath, to_2tuple, to_ntuple, trunc_normal_, _assert
 from .registry import register_model
 from .vision_transformer import checkpoint_filter_fn, get_init_weights_vit
+from .quantization import get_quantization_scale_and_zero_point, get_quantization_scale_and_zero_point_from_range, ActivationInfo, i_softmax
 
 
 _logger = logging.getLogger(__name__)
@@ -183,6 +184,8 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
+        self.q, self.k, self.v, self.attn = [ActivationInfo() for _ in range(4)]
+
     def _get_rel_pos_bias(self) -> torch.Tensor:
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)].view(self.window_area, self.window_area, -1)  # Wh*Ww,Wh*Ww,nH
@@ -214,6 +217,108 @@ class WindowAttention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B_, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+    def forward_quantized_dynamic(self, x, mask: Optional[torch.Tensor] = None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        scale_q, zero_point_q = get_quantization_scale_and_zero_point(q)
+        scale_k, zero_point_k = get_quantization_scale_and_zero_point(k)
+        q_quantized = (q / scale_q + zero_point_q).round()
+        k_quantized = (k.transpose(-2, -1) / scale_k + zero_point_k).round()
+        attn = scale_q * scale_k * torch.matmul(q_quantized - zero_point_q, k_quantized - zero_point_k)
+        attn = attn + self._get_rel_pos_bias()
+
+        if mask is not None:
+            num_win = mask.shape[0]
+            attn = attn.view(B_ // num_win, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        scale_attn, zero_point_attn = get_quantization_scale_and_zero_point(attn)
+        scale_v, zero_point_v = get_quantization_scale_and_zero_point(v)
+        attn_quantized = (attn / scale_attn + zero_point_attn).round()
+        v_quantized = (v / scale_v + zero_point_v).round()
+        x = scale_attn * scale_v * torch.matmul(attn_quantized - zero_point_attn, v_quantized - zero_point_v).transpose(1, 2).reshape(B_, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def forward_hooked(self, x, mask: Optional[torch.Tensor] = None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        self.q.update(q)
+        self.k.update(k)
+        self.v.update(v)
+        attn = (q @ k.transpose(-2, -1))
+        attn = attn + self._get_rel_pos_bias()
+
+        if mask is not None:
+            num_win = mask.shape[0]
+            attn = attn.view(B_ // num_win, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            self.attn.update(attn)
+            attn = self.softmax(attn)
+        else:
+            self.attn.update(attn)
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def forward_quantized(self, x, mask: Optional[torch.Tensor] = None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        if self.q.kl_threshold is None:
+            self.q.calc_threshold()
+        if self.k.kl_threshold is None:
+            self.k.calc_threshold()
+        if self.v.kl_threshold is None:
+            self.v.calc_threshold()
+        if self.attn.kl_threshold is None:
+            self.attn.calc_threshold(False)
+        q = q * self.scale
+        scale_q, zero_point_q = get_quantization_scale_and_zero_point_from_range(self.q.min, self.q.max)
+        scale_k, zero_point_k = get_quantization_scale_and_zero_point_from_range(self.k.min, self.k.max)
+        q_quantized = (q / scale_q + zero_point_q).round()
+        k_quantized = (k.transpose(-2, -1) / scale_k + zero_point_k).round()
+        attn = scale_q * scale_k * torch.matmul(q_quantized - zero_point_q, k_quantized - zero_point_k)
+        attn = attn + self._get_rel_pos_bias()
+        scale_attn, _ = get_quantization_scale_and_zero_point_from_range(self.attn.min, self.attn.max)
+
+        if mask is not None:
+            num_win = mask.shape[0]
+            attn = attn.view(B_ // num_win, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn_quantized = (attn / scale_attn).round()
+            attn_quantized, scale_attn = i_softmax(attn_quantized, scale_attn)
+        else:
+            attn_quantized = (attn / scale_attn).round()
+            attn_quantized, scale_attn = i_softmax(attn_quantized, scale_attn)
+
+        attn_quantized = self.attn_drop(attn_quantized)
+
+        scale_v, zero_point_v = get_quantization_scale_and_zero_point_from_range(self.v.min, self.v.max)
+        v_quantized = (v / scale_v + zero_point_v).round()
+        x = scale_attn * scale_v * torch.matmul(attn_quantized, v_quantized - zero_point_v).transpose(1, 2).reshape(B_, N, -1)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
