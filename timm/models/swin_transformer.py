@@ -287,14 +287,6 @@ class WindowAttention(nn.Module):
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
 
-        if self.q.kl_threshold is None:
-            self.q.calc_threshold()
-        if self.k.kl_threshold is None:
-            self.k.calc_threshold()
-        if self.v.kl_threshold is None:
-            self.v.calc_threshold()
-        if self.attn.kl_threshold is None:
-            self.attn.calc_threshold(False)
         q = q * self.scale
         scale_q, zero_point_q = get_quantization_scale_and_zero_point_from_range(self.q.min, self.q.max)
         scale_k, zero_point_k = get_quantization_scale_and_zero_point_from_range(self.k.min, self.k.max)
